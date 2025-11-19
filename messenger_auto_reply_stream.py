@@ -1,18 +1,22 @@
 """
-Messenger自动回复 - 流式生成版本
+Messenger自动回复 - 流式生成版本 + 图片识别解题
 - 支持OpenAI streaming
 - 实时发送：第一个词立即发送，然后逐步发送
 - 自动语言检测：中文用中文答，英文用英文答
+- 图片识别：使用GPT-4o Vision自动解题
 """
 
 import json
 import time
 import logging
 import re
+import base64
+import requests
 from playwright.sync_api import sync_playwright
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
+from pathlib import Path
 
 load_dotenv()
 
@@ -55,6 +59,11 @@ class MessengerAutoReplyStream:
         # 初始化OpenAI客户端
         self.openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         self.model = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+        self.vision_model = 'gpt-4o'  # 使用gpt-4o进行图片识别
+
+        # 创建图片存储目录
+        self.image_dir = Path("downloaded_images")
+        self.image_dir.mkdir(exist_ok=True)
 
         # 加载cookies
         try:
@@ -105,6 +114,132 @@ Requirements:
 
         except Exception as e:
             logger.error(f"❌ OpenAI API error: {e}")
+            return None
+
+    def encode_image_to_base64(self, image_path: str) -> str:
+        """将图片编码为base64"""
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+
+    def solve_image_problem(self, image_path: str, text_context: str = "") -> str:
+        """使用GPT-4 Vision识别图片并解题"""
+        try:
+            logger.info(f"🖼️  Analyzing image: {image_path}")
+
+            # 读取图片并转换为base64
+            base64_image = self.encode_image_to_base64(image_path)
+
+            # 检测语言（如果有文本上下文）
+            language = detect_language(text_context) if text_context else 'chinese'
+
+            # 构建提示词
+            if language == 'chinese':
+                prompt = """请仔细分析这张图片中的题目，并提供详细的解答。
+
+要求：
+1. 首先识别题目类型（数学、物理、化学、英语等）
+2. 清晰地列出题目内容
+3. 提供详细的解题步骤
+4. 给出最终答案
+5. 如果有多种解法，可以简单提及
+
+请用中文回复，语言简洁清晰。"""
+            else:
+                prompt = """Please analyze the problem in this image and provide a detailed solution.
+
+Requirements:
+1. Identify the problem type (math, physics, chemistry, etc.)
+2. State the problem clearly
+3. Provide step-by-step solution
+4. Give the final answer
+5. Mention alternative methods if applicable
+
+Reply in English, keep it concise and clear."""
+
+            # 如果有文本上下文，添加到提示中
+            if text_context:
+                prompt = f"Context: {text_context}\n\n{prompt}"
+
+            # 调用GPT-4 Vision API
+            response = self.openai_client.chat.completions.create(
+                model=self.vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}",
+                                    "detail": "high"  # 使用高质量分析
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=1000,
+                temperature=0.3  # 较低温度以获得更准确的答案
+            )
+
+            solution = response.choices[0].message.content
+            logger.info(f"✅ Solution generated: {solution[:100]}...")
+            return solution
+
+        except Exception as e:
+            logger.error(f"❌ Vision API error: {e}")
+            return None
+
+    def download_image(self, page, img_element) -> str:
+        """下载图片到本地并返回路径"""
+        try:
+            # 获取图片URL
+            img_url = img_element.get_attribute('src')
+
+            if not img_url:
+                logger.error("❌ No image URL found")
+                return None
+
+            # 如果是data URL,直接保存
+            if img_url.startswith('data:image'):
+                # 解析data URL
+                header, encoded = img_url.split(',', 1)
+                img_data = base64.b64decode(encoded)
+
+                # 保存图片
+                timestamp = int(time.time() * 1000)
+                image_path = self.image_dir / f"image_{timestamp}.jpg"
+                with open(image_path, 'wb') as f:
+                    f.write(img_data)
+
+                logger.info(f"✅ Image saved from data URL: {image_path}")
+                return str(image_path)
+
+            # 否则通过HTTP下载
+            logger.info(f"📥 Downloading image from: {img_url[:100]}")
+
+            # 使用cookies下载
+            cookies_dict = self.cookies
+            response = requests.get(img_url, cookies=cookies_dict, timeout=10)
+
+            if response.status_code == 200:
+                # 保存图片
+                timestamp = int(time.time() * 1000)
+                image_path = self.image_dir / f"image_{timestamp}.jpg"
+                with open(image_path, 'wb') as f:
+                    f.write(response.content)
+
+                logger.info(f"✅ Image downloaded: {image_path}")
+                return str(image_path)
+            else:
+                logger.error(f"❌ Failed to download image: {response.status_code}")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ Download error: {e}")
             return None
 
     def send_text_gradually(self, page, text: str):
@@ -303,7 +438,55 @@ Requirements:
                         logger.info(f"📩 NEW MESSAGE #{self.message_count}: {msg_text}")
                         logger.info(f"{'='*60}")
 
-                        # 使用流式生成获取AI回复
+                        # 检查是否包含图片
+                        img_element = last_msg_elem.query_selector('img')
+                        has_image = img_element is not None
+
+                        if has_image:
+                            logger.info("🖼️  Image detected! Processing with Vision API...")
+
+                            # 下载图片
+                            image_path = self.download_image(page, img_element)
+
+                            if image_path:
+                                # 使用Vision API解题
+                                solution = self.solve_image_problem(image_path, msg_text)
+
+                                if solution:
+                                    full_response = solution
+                                else:
+                                    full_response = "抱歉，无法识别图片内容。请尝试上传更清晰的图片。" if detect_language(msg_text) == 'chinese' else "Sorry, couldn't analyze the image. Please try uploading a clearer image."
+                            else:
+                                full_response = "抱歉，无法下载图片。请重新发送。" if detect_language(msg_text) == 'chinese' else "Sorry, couldn't download the image. Please resend it."
+
+                            # 直接发送解答，不使用stream
+                            sent_segments = self.send_text_gradually(page, full_response)
+
+                            if sent_segments:
+                                logger.info(f"{'='*60}\n")
+
+                                # 记录已处理
+                                self.processed_messages.add(msg_text)
+                                self.last_message_text = msg_text
+                                self.own_sent_messages.add(full_response)
+                                for segment in sent_segments:
+                                    self.own_sent_messages.add(segment.strip())
+
+                                logger.info(f"📝 Tracked {len(sent_segments)} segments to prevent self-reply")
+
+                                # 限制内存
+                                if len(self.processed_messages) > 50:
+                                    self.processed_messages.clear()
+                                if len(self.own_sent_messages) > 100:
+                                    self.own_sent_messages = set(list(self.own_sent_messages)[-50:])
+                            else:
+                                logger.error("❌ Failed to send reply")
+
+                            # 跳过后续文本处理
+                            time.sleep(3)
+                            continue
+
+                        # 使用流式生成获取AI回复（纯文本消息）
                         logger.info("🤖 Streaming AI response...")
                         stream = self.get_ai_reply_stream(msg_text)
 
