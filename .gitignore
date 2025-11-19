@@ -17,6 +17,10 @@ messenger_auth.json
 # Downloaded images
 downloaded_images/
 
+# Logs
+bot_output.log
+*.log
+
 # IDE
 .vscode/
 .idea/

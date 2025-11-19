@@ -129,32 +129,23 @@ Requirements:
             # 读取图片并转换为base64
             base64_image = self.encode_image_to_base64(image_path)
 
-            # 检测语言（如果有文本上下文）
-            language = detect_language(text_context) if text_context else 'chinese'
+            # 默认使用英文，简洁回答
+            prompt = """Analyze the problem in this image and provide the answer.
 
-            # 构建提示词
-            if language == 'chinese':
-                prompt = """请仔细分析这张图片中的题目，并提供详细的解答。
+Rules:
+1. For multiple choice or true/false questions: ONLY give the answer (e.g., "A", "True", "42")
+2. For calculation/proof problems: Show brief steps + final answer
+3. Be concise - no explanations unless necessary
+4. Reply in ENGLISH by default
+5. IMPORTANT: Use plain text for math - avoid LaTeX symbols like \\int, \\sqrt, etc.
+   Instead use: integral, sqrt(), ^2, /, etc.
 
-要求：
-1. 首先识别题目类型（数学、物理、化学、英语等）
-2. 清晰地列出题目内容
-3. 提供详细的解题步骤
-4. 给出最终答案
-5. 如果有多种解法，可以简单提及
-
-请用中文回复，语言简洁清晰。"""
-            else:
-                prompt = """Please analyze the problem in this image and provide a detailed solution.
-
-Requirements:
-1. Identify the problem type (math, physics, chemistry, etc.)
-2. State the problem clearly
-3. Provide step-by-step solution
-4. Give the final answer
-5. Mention alternative methods if applicable
-
-Reply in English, keep it concise and clear."""
+Format:
+- Multiple choice: "Answer: A"
+- True/False: "Answer: True"
+- Calculation: "Steps: integral(x^2) from 0 to 1 = [x^3/3] = 1/3
+Answer: 1/3"
+"""
 
             # 如果有文本上下文，添加到提示中
             if text_context:
@@ -375,9 +366,98 @@ Reply in English, keep it concise and clear."""
                     check_count += 1
                     logger.info(f"🔍 Check #{check_count} - Looking for messages...")
 
-                    # 获取所有消息气泡
+                    # 获取所有消息气泡和图片
                     messages = page.query_selector_all('div[dir="auto"]')
-                    logger.info(f"   Found {len(messages)} div[dir=\"auto\"] elements")
+                    all_images = page.query_selector_all('img[src]')  # 查找所有图片
+                    logger.info(f"   Found {len(messages)} div[dir=\"auto\"] elements, {len(all_images)} images")
+
+                    # 优先检查是否有新图片（过滤掉小图片如头像、emoji等）
+                    has_new_image = False
+                    latest_image = None
+                    if len(all_images) > 0:
+                        # 反向遍历图片，找到第一个满足条件的大图片
+                        for img in reversed(all_images):
+                            try:
+                                # 获取图片尺寸
+                                bounding_box = img.bounding_box()
+                                if bounding_box:
+                                    width = bounding_box['width']
+                                    height = bounding_box['height']
+
+                                    # 过滤掉小图片（头像、表情、图标）
+                                    # 消息图片通常宽度>100px
+                                    if width > 100 and height > 100:
+                                        img_src = img.get_attribute('src')
+                                        if img_src:
+                                            # 进一步过滤：排除头像URL (t39.30808-1, t39.30808-6 通常是头像)
+                                            if 't39.30808-1' not in img_src and 't39.30808-6' not in img_src:
+                                                img_id = f"[IMG]{img_src[:100]}"
+                                                # 检查这张图片是否已处理
+                                                if img_id not in self.processed_messages:
+                                                    has_new_image = True
+                                                    latest_image = img
+                                                    logger.info(f"   🖼️  Found NEW large image ({int(width)}x{int(height)}): {img_src[:80]}...")
+                                                    break  # 找到第一个就停止
+                            except Exception as e:
+                                continue
+
+                    if has_new_image and latest_image:
+                        # 处理新图片
+                        img_src = latest_image.get_attribute('src')
+                        message_id = f"[IMG]{img_src[:100]}"
+                        msg_text = ""  # 图片消息可能没有文本
+
+                        # 标记为已处理
+                        self.processed_messages.add(message_id)
+                        self.last_message_text = message_id
+
+                        self.message_count += 1
+                        logger.info(f"\n{'='*60}")
+                        logger.info(f"📩 NEW MESSAGE #{self.message_count}: [Image]")
+                        logger.info(f"🖼️  Image detected! Processing with Vision API...")
+                        logger.info(f"{'='*60}")
+
+                        # 下载图片
+                        try:
+                            image_path = self.download_image(page, latest_image)
+                            if image_path:
+                                logger.info(f"✅ Image downloaded: {image_path}")
+
+                                # 使用Vision API解析图片
+                                solution = self.solve_image_problem(image_path, msg_text)
+
+                                if solution:
+                                    logger.info(f"💡 Vision API solution generated")
+                                    full_response = solution
+
+                                    # 直接发送解答
+                                    sent_segments = self.send_text_gradually(page, full_response)
+
+                                    if sent_segments:
+                                        logger.info(f"{'='*60}\n")
+                                        self.own_sent_messages.add(full_response)
+                                        for segment in sent_segments:
+                                            self.own_sent_messages.add(segment.strip())
+                                        logger.info(f"📝 Tracked {len(sent_segments)} segments to prevent self-reply")
+                                    else:
+                                        logger.error("❌ Failed to send image solution")
+                                else:
+                                    logger.error("❌ Failed to get solution from Vision API")
+                            else:
+                                logger.error("❌ Failed to download image")
+                        except Exception as e:
+                            logger.error(f"❌ Error processing image: {e}")
+                            import traceback
+                            logger.error(traceback.format_exc())
+
+                        # 限制内存
+                        if len(self.processed_messages) > 50:
+                            self.processed_messages.clear()
+                        if len(self.own_sent_messages) > 100:
+                            self.own_sent_messages = set(list(self.own_sent_messages)[-50:])
+
+                        time.sleep(3)
+                        continue
 
                     if len(messages) > 0:
                         # 显示最后几条消息
@@ -393,9 +473,13 @@ Reply in English, keep it concise and clear."""
 
                         logger.info(f"   📝 Last message: '{msg_text[:100]}'")
 
-                        # 过滤掉无效消息
-                        if not msg_text:
-                            logger.info("   ⏭️  Skipped: Empty message")
+                        # 检查是否包含图片（即使文本为空也要处理）
+                        img_element = last_msg_elem.query_selector('img')
+                        has_image = img_element is not None
+
+                        # 过滤掉无效消息（但如果有图片，即使文本为空也处理）
+                        if not msg_text and not has_image:
+                            logger.info("   ⏭️  Skipped: Empty message without image")
                             time.sleep(3)
                             continue
 
@@ -411,14 +495,21 @@ Reply in English, keep it concise and clear."""
                             time.sleep(3)
                             continue
 
+                        # 为图片消息创建唯一标识（使用图片URL或时间戳）
+                        message_id = msg_text
+                        if has_image and img_element:
+                            img_src = img_element.get_attribute('src')
+                            if img_src:
+                                message_id = f"[IMG]{img_src[:100]}"  # 使用图片URL作为ID
+
                         # 检查是否已处理
-                        if msg_text in self.processed_messages:
+                        if message_id in self.processed_messages:
                             logger.info(f"   ⏭️  Skipped: Already processed")
                             time.sleep(3)
                             continue
 
                         # 检查是否是新消息
-                        if msg_text == self.last_message_text:
+                        if message_id == self.last_message_text:
                             logger.info(f"   ⏭️  Skipped: Same as last message")
                             time.sleep(3)
                             continue
@@ -435,12 +526,8 @@ Reply in English, keep it concise and clear."""
                         # 新消息！开始处理
                         self.message_count += 1
                         logger.info(f"\n{'='*60}")
-                        logger.info(f"📩 NEW MESSAGE #{self.message_count}: {msg_text}")
+                        logger.info(f"📩 NEW MESSAGE #{self.message_count}: {msg_text if msg_text else '[Image]'}")
                         logger.info(f"{'='*60}")
-
-                        # 检查是否包含图片
-                        img_element = last_msg_elem.query_selector('img')
-                        has_image = img_element is not None
 
                         if has_image:
                             logger.info("🖼️  Image detected! Processing with Vision API...")
@@ -466,8 +553,8 @@ Reply in English, keep it concise and clear."""
                                 logger.info(f"{'='*60}\n")
 
                                 # 记录已处理
-                                self.processed_messages.add(msg_text)
-                                self.last_message_text = msg_text
+                                self.processed_messages.add(message_id)
+                                self.last_message_text = message_id
                                 self.own_sent_messages.add(full_response)
                                 for segment in sent_segments:
                                     self.own_sent_messages.add(segment.strip())
@@ -513,8 +600,8 @@ Reply in English, keep it concise and clear."""
                                     logger.info(f"{'='*60}\n")
 
                                     # 记录已处理的原始消息
-                                    self.processed_messages.add(msg_text)
-                                    self.last_message_text = msg_text
+                                    self.processed_messages.add(message_id)
+                                    self.last_message_text = message_id
 
                                     # 记录完整回复和所有分段，防止回复自己的消息
                                     self.own_sent_messages.add(full_response)
